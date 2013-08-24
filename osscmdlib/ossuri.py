@@ -1,3 +1,10 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+## ossbrowser
+## Author: melory
+## Email:imsrch@melory.me
+## License: GPL Version 2
+
 import os
 import re
 import sys

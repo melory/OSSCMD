@@ -1,4 +1,10 @@
-#coding=utf8
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+## ossbrowser
+## Author: melory
+## Email:imsrch@melory.me
+## License: GPL Version 2
+
 from xml.dom import minidom
 
 def get_tag_text(element, tag):
