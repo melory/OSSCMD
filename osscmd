@@ -1,0 +1,1303 @@
+#!/usr/bin/env python
+## OSSCMD
+## Author: linjiudui
+## Email:linjd828917@gmail.com
+## License: GPL Version 2
+## learn from s3tools(s3tools.org)
+
+import sys
+
+reload(sys)
+sys.setdefaultencoding('utf-8')
+if float("%d.%d" % (sys.version_info[0], sys.version_info[1])) < 2.4:
+    sys.stderr.write("ERROR: Python 2.4 or higher required, sorry.\n")
+    sys.exit(1)
+
+import logging
+import time
+import os
+import errno
+import traceback
+import codecs
+import locale
+
+from copy import copy
+from optparse import OptionParser, Option, OptionValueError, IndentedHelpFormatter
+from logging import debug, info, warning, error
+from distutils.spawn import find_executable
+
+class ParameterError(Exception):
+    pass
+
+def output(message):
+    sys.stdout.write(message + "\n")
+
+def show_error_msg(xml_string, msg):
+    error(u"%s" % msg)
+    if xml_string is not None and xml_string != "": 
+        e = ErrorXml(xml_string)
+        e.show()
+
+def login(access_id, secret_access_key): 
+    '''login'''
+    oss = OssAPI(cfg.host_base, access_id, secret_access_key)
+    res = oss.get_service()
+    if (res.status / 100) == 2:
+        return oss
+    else:
+        return None
+
+def _get_filelist_local(local_uri):
+    info(u"Compiling list of local files...")
+    if local_uri.isdir():
+        local_base = local_uri.basename()
+        local_path = local_uri.path()
+        filelist = os.walk(local_path)
+        single_file = False
+    else:
+        local_base = ""
+        local_path = (local_uri.dirname())
+        filelist = [( local_path, [], [local_uri.basename()] )]
+        single_file = True
+    loc_list = {}
+    for root, dirs, files in filelist:
+        rel_root = root.replace(local_path, local_base, 1)
+        if(not single_file):
+            if(os.path.sep != '/'):
+                rel_root = '/'.join(rel_root.split(os.path.sep))
+
+            full_name = root
+            if not rel_root.endswith('/'):
+                rel_root = rel_root+'/'
+            ## get directory list
+            loc_list[rel_root] = {
+                    'is_dir' : True,
+                    'full_name_unicode' : full_name,
+                    'full_name' : full_name,
+                    'size' : 0, 
+                }
+            
+        ## get filelist for upload
+        for f in files:
+            full_name = os.path.join(root, f)
+            if not os.path.isfile(full_name):
+                continue
+            
+            relative_file = os.path.join(rel_root, f)
+            if os.path.sep != "/":
+                relative_file = "/".join(relative_file.split(os.path.sep))
+            if cfg.urlencoding_mode == "normal":
+                relative_file = replace_nonprintables(relative_file)
+            if relative_file.startswith('./'):
+                relative_file = relative_file[2:]
+            sr = os.stat_result(os.lstat(full_name))
+            loc_list[relative_file] = {
+                'is_dir' : False,
+                'full_name_unicode' : full_name,
+                'full_name' : full_name,
+                'size' : sr.st_size, 
+                'mtime' : sr.st_mtime,
+            }
+    return loc_list, single_file
+    
+def fetch_local_list(args, recursive = None):
+    local_uris = []
+    local_list = {}
+    single_file = False
+
+    if type(args) not in (list, tuple):
+        args = [args]
+
+    if recursive == None:
+        recursive = cfg.recursive
+
+    for arg in args:
+        uri = OSSUri(arg)
+        if not uri.type == 'file':
+            raise ParameterError("Expecting filename or directory instead of: %s" % arg)
+        if uri.isdir() and not recursive:
+            raise ParameterError("Use --recursive to upload a directory: %s" % arg)
+        local_uris.append(uri)
+
+    for uri in local_uris:
+        list_for_uri, single_file = _get_filelist_local(uri)
+        local_list.update(list_for_uri)
+
+    ## Single file is True if and only if the user 
+    ## specified one local URI and that URI represents
+    ## a FILE. Ie it is False if the URI was of a DIR
+    ## and that dir contained only one FILE. That's not
+    ## a case of single_file==True.
+    if len(local_list) > 1:
+        single_file = False
+
+    return local_list, single_file
+
+def _get_remote_key(common_prefix, obj_name):
+    """
+    four type of common_prefix
+    oss://bucket-name 
+    oss://bucket-name/dir/
+    oss://bucket-name/file
+    oss://bucket-name/prefix
+    """
+    ## bucket-name
+    if common_prefix == "":
+        return obj_name
+    ## directory   
+    if common_prefix.endswith('/'):
+        key = obj_name.replace(common_prefix, '', 1)
+    else:
+        ## file and prefix
+        common_prefix = common_prefix[:common_prefix.rfind('/')+1]
+        key = obj_name.replace(common_prefix, '', 1)
+    
+    if len(key) == 0:
+        key = u'.'
+    return key
+    
+
+def _get_filelist_remote(oss, remote_uri, recursive = True):
+    info(u"Retrieving list of remote files for %s ..." % remote_uri)
+    delimiter = '/'
+    if(recursive):
+        delimiter = ''
+    
+    re = oss.list_bucket(remote_uri.bucket(), remote_uri.object(), '', delimiter, maxkeys='', headers={})
+    xml_string = re.read()
+    if(re.status/100 != 2):
+        show_error_msg(xml_string, u"list bucket[%s] failed" %remote_uri.bucket())
+        return
+    cl, pl = GetBucketXml(xml_string).list()
+    
+    remote_list = {}
+    ##oss://bucket-name, oss://bucket-name/prefix, oss://bucket-name/dir/, oss://bucket-name/file
+    for obj in cl:
+        ## remove the common prefix
+        key = _get_remote_key(remote_uri.object(), unicodise(obj[0]))
+
+#        print key
+        remote_list[key] = {
+            'is_dir' : False,
+            'size' : int(obj[3]),
+            'timestamp' : obj[1],
+            'md5' : obj[2].strip('"').lower(),
+            'base_uri' : remote_uri,
+            'object_uri': '/'.join(["oss:/", remote_uri.bucket(), unicodise(obj[0])])
+        }
+    for obj in pl:
+        ## remove the common prefix
+        key = _get_remote_key(remote_uri.object(), unicodise(obj))
+        ## root directory
+        if(len(key) == 0): 
+            key = u"."
+        elif(key[0] == '/'):
+            key = key[1:]
+        remote_list[unicodise(obj)] = {'is_dir':True,
+                            'object_uri': '/'.join(["oss:/", remote_uri.bucket(), unicodise(obj)])}
+    return remote_list
+
+def fetch_remote_list(oss, args, recursive = None):
+    remote_uris = []
+    remote_list = {}
+
+    if type(args) not in (list, tuple):
+        args = [args]
+
+    if recursive == None:
+        recursive = cfg.recursive
+
+    for arg in args:
+        if(arg.endswith('*')):
+            arg = arg[:-1]
+        uri = OSSUri(arg)
+        if not uri.type == 'oss':
+            raise ParameterError("Expecting oss URI instead of '%s'" % arg)
+        remote_uris.append(uri)
+
+    for uri in remote_uris:
+        cur_list = _get_filelist_remote(oss, uri, recursive)
+        if cur_list is not None:
+            remote_list.update(cur_list)
+        
+    return remote_list
+
+def subcmd_object_del_uri(oss, uri_str, recursive = None):
+    if recursive is None:
+        recursive = cfg.recursive
+
+    remote_list = fetch_remote_list(oss, uri_str, recursive = recursive)
+
+    remote_count = len(remote_list)
+
+    info(u"Summary: %d remote files to delete" % remote_count)
+
+    if cfg.dry_run:
+        for key in remote_list:
+            output(u"delete: %s" % remote_list[key]['object_uri'])
+            
+        warning(u"Exitting now because of --dry-run")
+        return
+
+    for key in remote_list:
+        item = remote_list[key]
+        uri = OSSUri(item['object_uri'])
+        re = oss.delete_object(uri.bucket(), uri.object())
+        if(re.status/100 != 2):
+            show_error_msg(re.read(), u"Delete file %s failed" %item['object_uri'])
+            continue
+        output(u"File %s deleted" % item['object_uri'])
+        
+def cmd_bucket_create(args):
+    '''Create bucket'''
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    if(cfg.acl_public):
+        acl = "public-read"
+    else:
+        acl = "private"
+        
+    for arg in args:
+        uri = OSSUri(arg)
+        re = oss.put_bucket(uri.bucket(), acl=acl, headers={})
+        if (re.status / 100) == 2:
+            output(u"Bucket '%s' created" % arg)
+            return True
+        else:
+            show_error_msg(re.read(), u"create bucket [%s] failed" %arg)
+            return False
+        
+def cmd_bucket_delete(args):
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    for arg in args:
+        uri = OSSUri(arg)
+        re = oss.delete_bucket(uri.bucket())
+        if (re.status/100 != 2):
+            xml_string = re.read()
+            e = ErrorXml(xml_string)
+            if(e.code == "BucketNotEmpty" and cfg.recursive):
+                warning(u"Bucket is not empty. Removing all the objects from it first. This may take some time...")
+                subcmd_object_del_uri(oss, str(uri), recursive=True)
+                if cfg.dry_run:
+                    continue
+                re = oss.delete_bucket(uri.bucket())
+                if(re.status/100 != 2):
+                    show_error_msg(re.read(), u"delete bucket[%s] failed" %arg)
+                    continue
+            else:
+                show_error_msg(xml_string, u"delete bucket[%s] failed" %arg)
+                continue
+        output(u"Bucket '%s' removed" % arg)
+
+def cmd_buckets_list_all_all(args):
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+
+    re = oss.get_service()
+    xml_string = re.read()
+    if(re.status/100 != 2):
+        show_error_msg(xml_string, "Get Service failed:")
+        return
+    bl = [l[0] for l in GetServiceXml(xml_string).list()]
+    for bucket in bl:
+        subcmd_bucket_list(oss, OSSUri("oss://" + bucket))
+        output(u"")
+
+def subcmd_buckets_list_all(oss):
+    re = oss.get_service()
+    xml_string = re.read()
+    if(re.status / 100 != 2):
+        show_error_msg(xml_string, "Get Service failed:")
+        return
+    bl = GetServiceXml(xml_string).list()
+    for (name, cdate) in bl:
+        output(u"%s  oss://%s" % (formatDateTime(cdate), name))
+
+def subcmd_bucket_list(oss, uri):
+    bucket = uri.bucket()
+    prefix = uri.object()
+
+    debug(u"Bucket 'oss://%s':" % bucket)
+    
+    delimiter = '/'
+    if prefix.endswith('*'):
+        prefix = prefix[:-1]
+    if cfg.recursive:
+        delimiter = ''
+    
+    output(u"%s %s %s" %(bucket, prefix, delimiter))
+    re = oss.list_bucket(bucket, prefix, '', delimiter, maxkeys='', headers={})
+    xml_string = re.read()
+    if(re.status / 100 != 2):
+        show_error_msg(xml_string, u"list bucket[%s/%s] failed" %(bucket, prefix))
+        return
+    cl, pl = GetBucketXml(xml_string).list()
+#    print cl, pl
+    if(delimiter == '/'):
+        output(u"Bucket 'oss://%s':%d files, %d directory" % (bucket, len(cl), len(pl)))
+    else:
+        output(u"Bucket 'oss://%s':%d files" % (bucket, len(cl)))
+    if cfg.list_md5:
+        format_string = u"%(timestamp)16s %(size)9s%(coeff)1s  %(md5)32s  %(uri)s"
+    else:
+        format_string = u"%(timestamp)16s %(size)9s%(coeff)1s  %(uri)s"
+
+
+    if cfg.list_md5:
+        format_string = u"%(timestamp)16s %(size)9s%(coeff)1s  %(md5)32s  %(uri)s"
+    else:
+        format_string = u"%(timestamp)16s %(size)9s%(coeff)1s  %(uri)s"
+
+    for prefix in pl:
+        output(format_string % {"timestamp":"", "size":"DIR", "coeff":"", "md5":"",
+                                "uri":prefix})
+
+    for obj in cl:
+        size, size_coeff = formatSize(obj[3], cfg.human_readable_sizes)
+        output(format_string % {
+            "timestamp":obj[1],
+            "size" : str(size),
+            "coeff": size_coeff,
+            "md5" : obj[2].strip('"'),
+            "uri": obj[0],
+            })
+        
+
+def cmd_ls(args):
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    if len(args) > 0:
+        try:
+            uri = OSSUri(args[0])
+        except ValueError, e:
+            error(u"Parameter Error, %s", e)
+            return
+        if uri.type == "oss" and uri.has_bucket():
+            subcmd_bucket_list(oss, uri)
+            return
+        else:
+            error("Parameter Error:%s", args[0])
+            return
+    subcmd_buckets_list_all(oss)
+    
+def cmd_object_put(args):
+    """
+    put the local file or directory to the oss
+    empty directory will not put into the oss
+    """
+    if len(args) == 0:
+        raise ParameterError("You must specify a local file or directory and a OSS URI destination.")
+
+    try:
+        dst_uri = OSSUri(args.pop())
+    except ValueError, e:
+        error(u"Parameter Error, %s", e)
+        return
+    if dst_uri.type != 'oss':
+        raise ParameterError("Destination must be OSSUri. Got: %s" % dst_uri)
+    dst_base = str(dst_uri)
+    
+    if len(args) == 0:
+        raise ParameterError("Nothing to upload. Expecting a local file or directory.")
+
+    local_list, single_file_local = fetch_local_list(args)
+
+    local_count = len(local_list)
+    
+    info(u"Summary: %d local files to upload" % local_count)
+    
+    if local_count > 0:
+        if not dst_base.endswith("/"):
+            if not single_file_local:
+                raise ParameterError("Destination OSS URI must end with '/' (ie must refer to a directory on the remote side).")
+            local_list[local_list.keys()[0]]['remote_uri'] = dst_base
+        else:
+            for key in local_list:
+                local_list[key]['remote_uri'] = dst_base + key
+
+    if cfg.dry_run:
+        for key in local_list:
+            output(u"upload: %s -> %s" % (local_list[key]['full_name_unicode'], local_list[key]['remote_uri']))
+
+        warning(u"\nThe files didn't uploaded now because of --dry-run")
+        return
+    
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    seq = 0
+    success = 0
+    for key in local_list:
+        seq += 1
+        uri_final = OSSUri(local_list[key]['remote_uri'])
+        full_file_name = local_list[key]['full_name']
+        file_size = local_list[key]['size']
+        is_dir = local_list[key]['is_dir']
+        info(u"Sending file '%s[%d of %d]', please wait..." %  (full_file_name, seq, local_count))
+        
+        start_time = time.time()
+        if is_dir:
+            re = oss.put_object_from_string(uri_final.bucket(), uri_final.object(), "")
+        else:
+            re = oss.put_object_from_file(uri_final.bucket(), uri_final.object(), full_file_name)
+        end_time = time.time()
+        send_time = end_time-start_time
+        
+        if(re.status/100 != 2):
+            show_error_msg(re.read(), u"send file %s failed" %full_file_name)
+            continue
+
+        output(u"File '%s' stored as '%s' (%d bytes in %0.1fs)" %
+            (full_file_name, uri_final, file_size, send_time))
+        success += 1
+        if cfg.acl_public:
+            output(u"ACL is public, Public URL of the object is: %s" % (uri_final.public_url()))
+    output("\nTotal %d files transfered, successed:%d, failed:%d" %(
+                local_count, success, local_count-success) )
+
+def cmd_object_get(args):
+    if len(args) == 0:
+        raise ParameterError("Nothing to download. Expecting OSS URI.")
+
+    if OSSUri(args[-1]).type == 'file':
+        destination_base = args.pop()
+    else:
+        destination_base = "."
+
+    if len(args) == 0:
+        raise ParameterError("Nothing to download. Expecting OSS URI.")
+
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    
+    remote_list = fetch_remote_list(oss, args)
+
+    remote_count = len(remote_list)
+
+    info(u"Summary: %d remote files to download" % remote_count)
+
+    if destination_base.endswith(os.path.sep) and not os.path.exists(destination_base):
+        os.makedirs(destination_base)
+    if remote_count > 0:
+        if not os.path.isdir(destination_base):
+            if remote_count > 1:
+                raise ParameterError("Destination must be a directory when downloading multiple sources.")
+            remote_list[remote_list.keys()[0]]['local_filename'] = destination_base
+        else :
+            if destination_base[-1] != os.path.sep:
+                destination_base += os.path.sep
+            for key in remote_list:
+                local_filename = destination_base + key
+                if(os.name == 'nt'):
+                    local_filename = os.path.sep.join(local_filename.split('/'))
+                remote_list[key]['local_filename'] = local_filename
+                if local_filename.endswith(os.path.sep):
+                    remote_list[key]['is_dir'] = True
+
+    if cfg.dry_run:
+        for key in remote_list:
+            output(u"download: %s -> %s" % (remote_list[key]['object_uri'], remote_list[key]['local_filename']))
+
+        warning(u"The files have not downloaded now because of --dry-run")
+        return
+
+    seq = 0
+    success = 0
+    skip = 0
+    for key in remote_list:
+        seq += 1
+        item = remote_list[key]
+        uri = OSSUri(item['object_uri'])
+        ## Encode / Decode destination with "replace" to make sure it's compatible with current encoding
+        destination = item['local_filename']
+        
+        if item['is_dir']:
+            ##Directory
+            if(not os.path.exists(destination)):
+                os.makedirs(destination)
+                info(u"Creating directory: %s" % destination)
+                success += 1
+            else:skip += 1
+            continue
+        else:
+            ## File
+            try:
+                file_exists = os.path.exists(destination)
+                try:
+                    fp = open(destination, "ab")
+                except IOError, e:
+                    if e.errno == errno.ENOENT:
+                        basename = destination[:destination.rindex(os.path.sep)]
+                        info(u"Creating directory: %s" % basename)
+                        os.makedirs(basename)
+                        fp = open(destination, "ab")
+                    else:
+                        raise
+                if file_exists:
+                    if cfg.force:
+                        fp.seek(0L)
+                        fp.truncate()
+                    elif cfg.skip_existing:
+                        skip += 1
+                        info(u"Skipping over existing file: %s" % (destination))
+                        continue
+                    else:
+                        fp.close()
+                        raise ParameterError(u"File %s already exists. Use either of --force / --skip-existing or give it a new name." % destination)
+            except IOError, e:
+                error(u"Skipping %s: %s" % (destination, e.strerror))
+                continue
+        
+        info("Download file '%s[%d of %d]', please wait..." %  (key, seq, remote_count))
+        start_time = time.time()
+        try:
+            re = oss.get_object_to_file(uri.bucket(), uri.object(), item['local_filename'], headers={})
+        except IOError, e:
+            output(u"debug %s, %s, %s" %(str(uri), item['local_filename'], e))
+            continue
+        if(re.status/100 != 2):
+            show_error_msg(re.read(), u"download file %s from oss failed" % key)
+            continue
+        end_time = time.time()
+        send_time = end_time-start_time
+        success += 1
+        output(u"File %s saved as '%s' (%d bytes in %0.1f seconds)" %
+                (uri, os.path.abspath(destination), item['size'], send_time))
+    output("\nTotal %d files downloaded, successed:%d, skip:%d, failed:%d" %(
+                remote_count, success, skip, remote_count-success-skip) )
+
+def cmd_object_del(args):
+    for arg in args:
+        uri = OSSUri(arg)
+        if uri.type != "oss":
+            raise ParameterError("Expecting OSS URI instead of '%s'" % uri)
+        if not uri.has_object():
+            if cfg.recursive and not cfg.force:
+                raise ParameterError("Please use --force to delete ALL contents of %s" % arg)
+            elif not cfg.recursive:
+                raise ParameterError("File name required, not only the bucket name. Alternatively use --recursive")
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    subcmd_object_del_uri(oss, arg)
+    
+def cmd_setacl(args):
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    
+    if(len(args) == 0):
+        raise ParameterError("You must specify a bucket or object.")
+    if (cfg.acl_public is None):
+        return
+    elif(cfg.acl_public):
+        acl = "public-read"
+    else:
+        acl = "private"
+        
+    for arg in args:
+        uri = OSSUri(arg)
+        if uri.type != "oss":
+            raise ParameterError("Expecting OSS URI instead of '%s'" % uri)
+        re = oss.put_bucket(uri.bucket(), acl, headers={})
+        if re.status/100 != 2:
+            show_error_msg(re.read(), u"set acl for bucket[%s] failed" %uri.bucket())
+            continue
+        output(u"set %s for bucket[oss://%s] success" %(acl, uri.bucket()))
+
+def cmd_getacl(args):
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    
+    for arg in args:
+        uri = OSSUri(arg)
+        if uri.type != "oss":
+            raise ParameterError("Expecting OSS URI instead of '%s'" % uri)
+        re = oss.get_bucket_acl(uri.bucket())
+        if re.status/100 != 2:
+            show_error_msg(re.read(), u"get acl of object[%s] failed" %arg)
+            continue
+        bucket_acl = GetBucketAclXml(re.read()).grant
+        output(u"The acl of obcjet[%s] is %s" %(arg, bucket_acl))
+
+def cmd_head_object(args):
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    
+    for arg in args:
+        uri = OSSUri(arg)
+        if uri.type != "oss":
+            raise ParameterError("Expecting OSS URI instead of '%s'" % uri)
+        re = oss.head_object(uri.bucket(), uri.object(), headers={})
+        
+        if re.status/100 != 2:
+            error("get info of object %s failed, No Suck Object?" %arg)
+            continue
+        headers = dict(re.getheaders())
+        output(u"The info of object %s:" %arg)
+        for key in headers:
+            output(u"%-20s: %s" %(key, headers[key]))
+
+def subcmd_cp_mv(args, action_str):
+    if len(args) < 2:
+        raise ParameterError("Expecting two or more OSS URIs for %s" %action_str)
+    
+    dst_base_uri = OSSUri(args.pop())
+    if dst_base_uri.type != "oss":
+        raise ParameterError("Destination must be OSS URI.")
+    destination_base = dst_base_uri.uri()
+    
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    remote_list = fetch_remote_list(oss, args, recursive=cfg.recursive)
+
+    remote_count = len(remote_list)
+
+    info(u"Summary: %d remote files to %s" % (remote_count, action_str))
+    
+    if(remote_count == 0):
+        error(u"No object find in OSS, check the source OSSURi")
+        return 
+    if(remote_count > 1 and not cfg.recursive):
+        error(u"Please use -r(--recursive)option to copy/move more than one objects")
+        return
+        
+    if cfg.recursive:
+        if not destination_base.endswith("/"):
+            destination_base += "/"
+        for key in remote_list:
+            remote_list[key]['dest_name'] = destination_base + key
+    else:
+        #print remote_list.keys()
+        key = remote_list.keys()[0]
+        if destination_base.endswith("/"):
+            ##copy directory
+            if key.endswith('/'):
+                dest_file_name = key[(key[:-1].rfind('/')+1):]
+            else:
+                dest_file_name = key[(key.rfind('/')+1):]
+            remote_list[key]['dest_name'] = (destination_base + dest_file_name)
+        else:
+            remote_list[key]['dest_name'] = (destination_base)
+        
+    if cfg.dry_run:
+        for key in remote_list:
+            output(u"%s: %s -> %s" % (action_str, remote_list[key]['object_uri'], remote_list[key]['dest_name']))
+
+        warning(u"OSS didn't perform %s action now because of --dry-run" %action_str)
+        return
+
+    for key in remote_list:
+        item = remote_list[key]
+        #print item
+        src_uri = OSSUri(item['object_uri'])
+        dst_uri = OSSUri(item['dest_name'])
+#        print (dst_uri.object())
+        headers={"x-oss-copy-source":item['object_uri'][5:]}
+        
+        bkt = dst_uri.bucket()
+        obj = dst_uri.object()
+#        print type(obj), obj
+        re = oss.object_operation('PUT', bkt, obj, headers, "")
+        if(re.status/100 != 2):
+            show_error_msg(re.read(), u"%s from %s to %s failed" %(action_str, item['object_uri'], item['dest_name']))
+            continue
+        
+        if cfg.acl_public:
+            info(u"ACL is public, Public URL is: %s" % dst_uri.public_url())
+        
+        if action_str == 'move':
+            re = oss.delete_object(src_uri.bucket(), src_uri.object(), headers={})
+            if re.status/100 != 2:
+                show_error_msg(re.read(), u"Delete object %s failed" %item['object_uri'])
+                continue
+        output(u"%s: %s -> %s" % (action_str, item['object_uri'], item['dest_name']))
+
+
+def _compare_filelists(src_list, dst_list, src_remote, dst_remote):
+    def __direction_str(is_remote):
+        return is_remote and "remote" or "local"
+
+    info(u"Verifying attributes...")
+    exists_list = {}
+
+    debug("Comparing filelists (direction: %s -> %s)" % (__direction_str(src_remote), __direction_str(dst_remote)))
+    src_list.keys().sort()
+    dst_list.keys().sort()
+    debug("src_list.keys: %s" % src_list.keys())
+    debug("dst_list.keys: %s" % dst_list.keys())
+
+    for file in src_list.keys():
+        debug(u"CHECK: %s" % file)
+        ## Skip Directory
+        if src_remote == False and src_list[file]['is_dir']:
+            continue
+        
+        if dst_list.has_key(file):
+            if dst_remote == False and dst_list[file]['is_dir']:
+                continue
+            ## Was --skip-existing requested?
+            if cfg.skip_existing:
+                debug(u"IGNR: %s (used --skip-existing)" % (file))
+                exists_list[file] = src_list[file]
+                del(src_list[file])
+                ## Remove from destination-list, all that is left there will be deleted
+                del(dst_list[file])
+                continue
+
+            attribs_match = True
+            ## Check size first
+            if 'size' in cfg.sync_checks and dst_list[file]['size'] != src_list[file]['size']:
+                debug(u"%s (size mismatch: src=%s dst=%s)" % (file, src_list[file]['size'], dst_list[file]['size']))
+                attribs_match = False
+            
+            if attribs_match and 'md5' in cfg.sync_checks:
+                ## same size, check MD5
+                if src_remote == False and dst_remote == True:
+                    src_md5 = hash_file_md5(src_list[file]['full_name'])
+                    dst_md5 = dst_list[file]['md5']
+                elif src_remote == True and dst_remote == False:
+                    src_md5 = src_list[file]['md5']
+                    dst_md5 = hash_file_md5(dst_list[file]['full_name'])
+
+                if src_md5 != dst_md5:
+                    ## Checksums are different.
+                    attribs_match = False
+                    debug(u"%s (md5 mismatch: src=%s dst=%s)" % (file, src_md5, dst_md5))
+
+            if attribs_match:
+                ## Remove from source-list, all that is left there will be transferred
+                debug(u"IGNR: %s (transfer not needed)" % file)
+                exists_list[file] = src_list[file]
+                del(src_list[file])
+
+            ## Remove from destination-list, all that is left there will be deleted
+            del(dst_list[file])
+
+    return src_list, dst_list, exists_list
+
+def cmd_sync_remote2local(args):
+    
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    destination_base = args[-1]
+    local_list, single_file_local = fetch_local_list(destination_base, recursive = True)
+    remote_list = fetch_remote_list(oss, args[:-1], recursive = True)
+
+    local_count = len(local_list)
+    remote_count = len(remote_list)
+
+    info(u"Found %d remote files, %d local files" % (remote_count, local_count))
+
+    remote_list, local_list, existing_list = _compare_filelists(remote_list, local_list, src_remote = True, dst_remote = False)
+
+    local_count = len(local_list)
+    remote_count = len(remote_list)
+
+    info(u"Summary: %d remote files to download, %d local files to delete" % (remote_count, local_count))
+    
+    
+    if remote_count > 0: 
+        if not os.path.isdir(destination_base):
+            if remote_count > 1:
+                raise ParameterError("Destination must be a directory when downloading multiple sources.")
+            remote_list[remote_list.keys()[0]]['local_filename'] = destination_base
+        else:
+            if destination_base[-1] != os.path.sep:
+                destination_base += os.path.sep
+            for key in remote_list:
+                local_filename = destination_base + key
+                if os.path.sep != "/":
+                    local_filename = os.path.sep.join(local_filename.split("/"))
+                remote_list[key]['local_filename'] = local_filename
+                if local_filename.endswith(os.path.sep):
+                    remote_list[key]['is_dir'] = True
+
+    if cfg.dry_run:
+        if cfg.delete_removed:
+            for key in local_list:
+                if(local_list[key]['is_dir']):
+                    continue
+                output(u"delete: %s" % local_list[key]['full_name_unicode'])
+#        print list([remote_list[key]['local_filename']])
+        for key in remote_list:
+            output(u"download: %s -> %s" % (remote_list[key]['object_uri'], remote_list[key]['local_filename']))
+
+        warning(u"Exitting now because of --dry-run")
+        return
+
+    if cfg.delete_removed:
+        for key in local_list:
+            if(local_list[key]['is_dir']):
+                continue
+            os.unlink(local_list[key]['full_name'])
+            output(u"deleted: %s" % local_list[key]['full_name_unicode'])
+
+    total_size = 0
+    timestamp_start = time.time()
+    file_list = remote_list.keys()
+    file_list.sort()
+    success = 0
+    seq = 0
+    
+    for file in file_list:
+        seq += 1
+        item = remote_list[file]
+        uri = OSSUri(item['object_uri'])
+        ## Encode / Decode destination with "replace" to make sure it's compatible with current encoding
+        destination = item['local_filename']
+        
+        if item['is_dir']:
+            ##Directory
+            if(not os.path.exists(destination)):
+                os.makedirs(destination)
+                info(u"Creating directory: %s" % destination)
+                success += 1
+            continue
+        else:
+            ## File
+            try:
+                file_exists = os.path.exists(destination)
+                try:
+                    fp = open(destination, "ab")
+                except IOError, e:
+                    if e.errno == errno.ENOENT:
+                        basename = destination[:destination.rindex(os.path.sep)]
+                        info(u"Creating directory: %s" % basename)
+                        os.makedirs(basename)
+                        fp = open(destination, "ab")
+                    else:
+                        raise
+                if file_exists:
+                    fp.seek(0L)
+                    fp.truncate()
+                else:
+                    fp.close()
+                    raise ParameterError(u"File %s already exists failed to truncate it" % destination)
+            except IOError, e:
+                error(u"Skipping %s: %s" % (destination, e.strerror))
+                continue
+            
+        info("sync file '%s[%d of %d]', please wait..." %  (file, seq, remote_count))
+        start_time = time.time()
+        try:
+            re = oss.get_object_to_file(uri.bucket(), uri.object(), destination)
+        except IOError, e:
+            output(u"debug %s, %s, %s" %(str(uri), item['local_filename'], e))
+            continue
+        if(re.status/100 != 2):
+            show_error_msg(re.read(), u"sync file %s from oss failed" % file)
+            continue
+        end_time = time.time()
+        send_time = end_time-start_time
+        success += 1
+        output(u"File %s synchronized as '%s' (%d bytes in %0.1f seconds)" %
+                (uri, os.path.abspath(destination), item['size'], send_time))
+
+    total_elapsed = time.time() - timestamp_start
+
+    output(u"Done. Sync %d files of %d bytes in %0.1f seconds" % (success, total_size, total_elapsed))
+
+
+def cmd_sync_local2remote(args):
+    destination_base_uri = OSSUri(args[-1])
+    if destination_base_uri.type != 'oss':
+        raise ParameterError("Destination must be OSSUri. Got: %s" % destination_base_uri)
+    destination_base = str(destination_base_uri)
+    
+    oss = OssAPI(cfg.host_base, cfg.access_id, cfg.secret_access_key)
+    local_list, single_file_local = fetch_local_list(args[:-1], recursive = True)
+    remote_list = fetch_remote_list(oss, destination_base, recursive = True)
+
+    local_count = len(local_list)
+    remote_count = len(remote_list)
+
+    info(u"Found %d local files, %d remote files" % (local_count, remote_count))
+
+    ## only one file for sync
+    if single_file_local and len(local_list) == 1 and len(remote_list) == 1:
+        remote_list_entry = remote_list[remote_list.keys()[0]]
+        remote_list = { local_list.keys()[0] : remote_list_entry }
+
+    local_list, remote_list, existing_list = _compare_filelists(local_list, remote_list, src_remote = False, dst_remote = True)
+
+    local_count = len(local_list)
+    remote_count = len(remote_list)
+
+    info(u"Summary: %d local files to upload, %d remote files to delete" % (local_count, remote_count))
+
+    if local_count > 0:
+        ## Populate 'remote_uri' only if we've got something to upload
+        if not destination_base.endswith("/"):
+            if not single_file_local:
+                raise ParameterError("Destination OSS URI must end with '/' (ie must refer to a directory on the remote side).")
+            local_list[local_list.keys()[0]]['remote_uri'] = destination_base
+        else:
+            for key in local_list:
+                local_list[key]['remote_uri'] = destination_base + key
+
+    if cfg.dry_run:
+        if cfg.delete_removed:
+            for key in remote_list:
+                output(u"delete: %s" % remote_list[key]['object_uri'])
+        for key in local_list:
+            output(u"upload: %s -> %s" % (local_list[key]['full_name_unicode'], local_list[key]['remote_uri']))
+
+        warning(u"Exitting now because of --dry-run")
+        return
+
+    if cfg.delete_removed:
+        for key in remote_list:
+            uri = OSSUri(remote_list[key]['object_uri'])
+            oss.delete_object(uri.bucket(), uri.object(), headers={})
+            output(u"deleted: '%s'" % uri)
+
+    total_size = 0
+    timestamp_start = time.time()
+    success = 0
+    file_list = local_list.keys()
+
+    file_list.sort()
+    for file_name in file_list:
+        item = local_list[file_name]
+        src = item['full_name']
+        uri = OSSUri(item['remote_uri'])
+        is_dir = item['is_dir']
+        if is_dir:
+            re = oss.put_object_from_string(uri.bucket(), uri.object(), "")
+        else:
+            re = oss.put_object_from_file(uri.bucket(), uri.object(), src)
+        if(re.status/100 != 2):
+            show_error_msg(re.read(), u"upload file %s failed" %item['full_name_unicode'])
+            continue
+        total_size += item["size"]
+        success += 1
+        output(u"File '%s' stored as '%s'" % (
+                item['full_name_unicode'], uri))
+        
+
+    total_elapsed = (time.time() - timestamp_start)
+    output(u"Done. Uploaded %d bytes of %d files in %0.1f seconds" % (total_size, success, total_elapsed))
+
+def cmd_sync(args):
+    if (len(args) < 2):
+        raise ParameterError("Need two parameters(src, dst): LOCAL_DIR OSSUri or OSSUri LOCAL_DIR")
+
+    if OSSUri(args[0]).type == "file" and OSSUri(args[-1]).type == "oss":
+        return cmd_sync_local2remote(args)
+    if OSSUri(args[0]).type == "oss" and OSSUri(args[-1]).type == "file":
+        return cmd_sync_remote2local(args)
+    raise ParameterError("Invalid source/destination: '%s'" % "' '".join(args))
+
+def cmd_cp(args):
+    subcmd_cp_mv(args, "copy")
+    pass
+
+def cmd_mv(args):
+    subcmd_cp_mv(args, "move")
+    pass
+
+def cmd_sign(args):
+    string_to_sign = args.pop()
+    debug("string-to-sign: %r" % string_to_sign)
+    signature = sign_string(string_to_sign)
+    output("Signature: %s" % signature)
+        
+def run_configure(config_file):
+    cfg = Config()
+    options = [
+        ("access_id", "Access ID", "Access ID and Secret Access key are your identifiers for OSS"),
+        ("secret_access_key", "Secret Access Key"),
+        ]
+
+    try:
+        while 1:
+            output(u"\nEnter new values or accept defaults in brackets with Enter.")
+            output(u"Refer to user manual for detailed description of all options.")
+            for option in options:
+                prompt = option[1]
+
+                try:
+                    val = getattr(cfg, option[0])
+                    if type(val) is bool:
+                        val = val and "Yes" or "No"
+                    if val not in (None, ""):
+                        prompt += " [%s]" % val
+                except AttributeError:
+                    pass
+
+                if len(option) >= 3:
+                    output(u"\n%s" % option[2])
+
+                val = raw_input(prompt + ": ")
+                if val != "":
+                    setattr(cfg, option[0], val)
+            output(u"\nNew settings:")
+            for option in options:
+                output(u"  %s: %s" % (option[1], getattr(cfg, option[0])))
+            val = raw_input("\nTest access with supplied credentials? [Y/n] ")
+            if val.lower().startswith("y") or val == "":
+                try:
+                    output(u"Please wait...")
+                    oss = login(cfg.access_id, cfg.secret_access_key)
+                    if oss is None:
+                        error(u"Test failed")
+                    else:
+                        output(u"Success. Your identity has been verified successful.")
+
+                except Exception, e:
+                    error(u"Test failed: %s" % (e))
+                    val = raw_input("\nRetry configuration? [Y/n] ")
+                    if val.lower().startswith("y") or val == "":
+                        continue
+                    
+
+            val = raw_input("\nSave settings? [y/N] ")
+            if val.lower().startswith("y"):
+                break
+            val = raw_input("Retry configuration? [Y/n] ")
+            if val.lower().startswith("n"):
+                raise EOFError()
+
+        ## Overwrite existing config file, make it user-readable only
+        old_mask = os.umask(0077)
+        try:
+            os.remove(config_file)
+        except OSError, e:
+            if e.errno != errno.ENOENT:
+                raise
+        f = open(config_file, "w")
+        os.umask(old_mask)
+        cfg.dump_config(f)
+        f.close()
+        output(u"Configuration saved to '%s'" % config_file)
+
+    except (EOFError, KeyboardInterrupt):
+        output(u"\nConfiguration aborted. Changes were NOT saved.")
+        return
+    
+    except IOError, e:
+        error(u"Writing config file failed: %s: %s" % (config_file, e.strerror))
+        sys.exit(1)
+
+def get_commands_list():
+    return [
+    {"cmd":"mb", "label":"Make bucket", "param":"BUCKET [BUCKET]", "func":cmd_bucket_create, "argc":1},
+    {"cmd":"rb", "label":"Remove bucket", "param":"BUCKET", "func":cmd_bucket_delete, "argc":1},
+    {"cmd":"ls", "label":"List objects or buckets", "param":"[oss://BUCKET[/PREFIX]]", "func":cmd_ls, "argc":0},
+    {"cmd":"la", "label":"List all object in all buckets", "param":"", "func":cmd_buckets_list_all_all, "argc":0},
+    {"cmd":"put", "label":"Put file into bucket", "param":"FILE [FILE...] oss://BUCKET[/PREFIX]", "func":cmd_object_put, "argc":2},
+    {"cmd":"get", "label":"Get file from bucket", "param":"oss://BUCKET/OBJECT LOCAL_FILE", "func":cmd_object_get, "argc":1},
+    {"cmd":"del", "label":"Delete file from bucket", "param":"oss://BUCKET/OBJECT", "func":cmd_object_del, "argc":1},
+    {"cmd":"sync", "label":"Synchronize a directory tree to OSS", "param":"LOCAL_DIR oss://BUCKET[/PREFIX] or oss://BUCKET[/PREFIX] LOCAL_DIR", "func":cmd_sync, "argc":2},
+    {"cmd":"info", "label":"Get various information about objects", "param":"oss://BUCKET/OBJECT", "func":cmd_head_object, "argc":1},
+    {"cmd":"cp", "label":"Copy object", "param":"oss://BUCKET1/OBJECT1 oss://BUCKET2[/OBJECT2]", "func":cmd_cp, "argc":2},
+    {"cmd":"mv", "label":"Move object", "param":"oss://BUCKET1/OBJECT1 oss://BUCKET2[/OBJECT2]", "func":cmd_mv, "argc":2},
+    {"cmd":"setacl", "label":"Modify Access control list for Bucket or Files", "param":"oss://BUCKET[/OBJECT]", "func":cmd_setacl, "argc":1},
+    {"cmd":"getacl", "label":"Get Access control of Bucket or Files", "param":"oss://BUCKET[/OBJECT]", "func":cmd_getacl, "argc":1},
+    {"cmd":"sign", "label":"Sign arbitrary string using the secret key", "param":"STRING-TO-SIGN", "func":cmd_sign, "argc":1},
+  ]
+
+    
+def format_commands(progname, commands_list):
+    help = "Commands:\n"
+    for cmd in commands_list:
+        help += "  %s\n      %s %s %s\n" % (cmd["label"], progname, cmd["cmd"], cmd["param"])
+    return help
+
+class OptionMimeType(Option):
+    def check_mimetype(self, option, opt, value):
+        if re.compile("^[a-z0-9]+/[a-z0-9+\.-]+$", re.IGNORECASE).match(value):
+            return value
+        raise OptionValueError("option %s: invalid MIME-Type format: %r" % (opt, value))
+
+class OptionAll(OptionMimeType):
+    TYPE_CHECKER = copy(Option.TYPE_CHECKER)
+    TYPE_CHECKER["mimetype"] = OptionMimeType.check_mimetype
+    TYPES = Option.TYPES + ("mimetype",)
+
+class MyHelpFormatter(IndentedHelpFormatter):
+    def format_epilog(self, epilog):
+        if epilog:
+            return "\n" + epilog + "\n"
+        else:
+            return ""
+def main():
+    global cfg
+
+    commands_list = get_commands_list()
+    commands = {}
+
+    ## Populate "commands" from "commands_list"
+    for cmd in commands_list:
+        if cmd.has_key("cmd"):
+            commands[cmd["cmd"]] = cmd
+
+    default_verbosity = Config().verbosity
+    optparser = OptionParser(option_class=OptionAll, formatter=MyHelpFormatter())
+    #optparser.disable_interspersed_args()
+
+    config_file = None
+    if os.getenv("HOME"):
+        config_file = os.path.join(os.getenv("HOME"), ".osscfg")
+    elif os.name == "nt" and os.getenv("USERPROFILE"):
+        config_file = os.path.join(os.getenv("USERPROFILE").decode('mbcs'), "Application Data", "osscmd.ini")
+
+    preferred_encoding = locale.getpreferredencoding() or "UTF-8"
+
+    optparser.set_defaults(encoding=preferred_encoding)
+    optparser.set_defaults(config=config_file)
+    optparser.set_defaults(verbosity=default_verbosity)
+
+    optparser.add_option("--configure", dest="run_configure", action="store_true", help="Invoke interactive (re)configuration tool.")
+    optparser.add_option("-c", "--config", dest="config", metavar="FILE", help="Config file name. Defaults to %default")
+    optparser.add_option("--dump-config", dest="dump_config", action="store_true", help="Dump current configuration after parsing config files and command line options and exit.")
+
+    optparser.add_option("-n", "--dry-run", dest="dry_run", action="store_true", help="Only show what should be uploaded or downloaded but don't actually do it. May still perform OSS requests to get bucket listings and other information though (only for file transfer commands)")
+
+    optparser.add_option("-f", "--force", dest="force", action="store_true", help="Force overwrite and other dangerous operations.")
+#    optparser.add_option("--continue", dest="get_continue", action="store_true", help="Continue getting a partially downloaded file (only for [get] command).")
+    optparser.add_option("--skip-existing", dest="skip_existing", action="store_true", help="Skip over files that exist at the destination (only for [get] and [sync] commands).")
+    optparser.add_option("-r", "--recursive", dest="recursive", action="store_true", help="Recursive upload, download or removal.")
+    optparser.add_option("--check-md5", dest="check_md5", action="store_true", help="Check MD5 sums when comparing files for [sync]. (default)")
+    optparser.add_option("--no-check-md5", dest="check_md5", action="store_false", help="Do not check MD5 sums when comparing files for [sync]. Only size will be compared. May significantly speed up transfer but may also miss some changed files.")
+    optparser.add_option("-P", "--acl-public", dest="acl_public", action="store_true", help="Store objects with ACL allowing read for anyone.")
+    optparser.add_option("--acl-private", dest="acl_public", action="store_false", help="Store objects with default ACL allowing access for you only.")
+
+    optparser.add_option("--delete-removed", dest="delete_removed", action="store_true", help="Delete remote objects with no corresponding local file [sync]")
+    optparser.add_option("--no-delete-removed", dest="delete_removed", action="store_false", help="Don't delete remote objects.")
+
+    optparser.add_option("--list-md5", dest="list_md5", action="store_true", help="Include MD5 sums in bucket listings (only for 'ls' command).")
+    optparser.add_option("-H", "--human-readable-sizes", dest="human_readable_sizes", action="store_true", help="Print sizes in human readable form (eg 1kB instead of 1234).")
+
+    optparser.add_option("-v", "--verbose", dest="verbosity", action="store_const", const=logging.INFO, help="Enable verbose output.")
+    optparser.add_option("-d", "--debug", dest="verbosity", action="store_const", const=logging.DEBUG, help="Enable debug output.")
+    optparser.add_option("--version", dest="show_version", action="store_true", help="Show osscmd version (%s) and exit." % (pkginfo.version))
+
+    optparser.set_usage(optparser.usage + " COMMAND [parameters]")
+    optparser.set_description('osscmd is a tool for managing objects in ' + 
+        'Alibaba oss(open storage service). It allows for making and removing ' + 
+        '"buckets" and uploading, downloading and removing ' + 
+        '"objects" from these buckets.')
+    optparser.epilog = format_commands(optparser.get_prog_name(), commands_list)
+
+    (options, args) = optparser.parse_args()
+
+    logging.basicConfig(level=options.verbosity,
+                        format='%(levelname)s: %(message)s',
+                        stream=sys.stderr)
+    
+    if options.show_version:
+        output(u"osscmd version %s" % pkginfo.version)
+        sys.exit(0)
+
+    if not options.config:
+        error(u"Can't find a config file. Please use --config option.")
+        sys.exit(1)
+
+    try:
+        cfg = Config(options.config)
+    except IOError, e:
+        if options.run_configure:
+            cfg = Config()
+        else:
+            error(u"%s: %s" % (options.config, e.strerror))
+            error(u"Configuration file not available.")
+            error(u"Consider using --configure parameter to create one.")
+            sys.exit(1)
+
+    ## logging level adjustments
+    ## according to configfile and command line parameters
+    if options.verbosity != default_verbosity:
+        cfg.verbosity = options.verbosity
+    logging.root.setLevel(cfg.verbosity)
+
+    ## Process --(no-)check-md5
+    if options.check_md5 == False:
+        try:
+            cfg.sync_checks.remove("md5")
+        except:
+            pass
+    if options.check_md5 == True and cfg.sync_checks.count("md5") == 0:
+        cfg.sync_checks.append("md5")
+
+    ## Update Config with other parameters
+    for option in cfg.option_list():
+        try:
+            if getattr(options, option) != None:
+                debug(u"Updating Config.Config %s -> %s" % (option, getattr(options, option)))
+                cfg.update_option(option, getattr(options, option))
+        except AttributeError:
+            ## Some Config() options are not settable from command line
+            pass
+
+    ## Special handling for tri-state options (True, False, None)
+    cfg.update_option("acl_public", options.acl_public)
+
+    ## Set output and filesystem encoding for printing out filenames.
+    sys.stdout = codecs.getwriter(cfg.encoding)(sys.stdout, "replace")
+    sys.stderr = codecs.getwriter(cfg.encoding)(sys.stderr, "replace")
+
+
+    if options.dump_config:
+        cfg.dump_config(sys.stdout)
+        sys.exit(0)
+
+    if options.run_configure:
+        run_configure(options.config)
+        sys.exit(0)
+
+    if len(args) < 1:
+        error(u"Missing command. Please run with --help for more information.")
+        sys.exit(1)
+
+    args = [unicodise(arg) for arg in args]
+    
+    command = args.pop(0)
+    try:
+        debug(u"Command: %s" % commands[command]["cmd"])
+        cmd_func = commands[command]["func"]
+    except KeyError, e:
+        error(u"Invalid command: %s" % e)
+        sys.exit(1)
+
+    if len(args) < commands[command]["argc"]:
+        error(u"Not enough paramters for command '%s'" % command)
+        sys.exit(1)
+
+    cmd_func(args)
+    
+def report_exception(e):
+    tb = traceback.format_exc(sys.exc_info())
+    e_class = str(e.__class__)
+    e_class = e_class[e_class.rfind(".") + 1 :-2]
+    sys.stderr.write(u"Problem: %s: %s\n" % (e_class, e))
+    try:
+        sys.stderr.write("osscmd:   %s\n" % pkginfo.version)
+    except NameError:
+        sys.stderr.write("osscmd:   unknown version. Module import problem?\n")
+    sys.stderr.write("\n")
+    sys.stderr.write(unicode(tb, errors="replace"))
+
+    if type(e) == ImportError:
+        sys.stderr.write("\n")
+        sys.stderr.write("Your sys.path contains these entries:\n")
+        for path in sys.path:
+            sys.stderr.write(u"\t%s\n" % path)
+        sys.stderr.write("Now the question is where have the osscmd modules been installed?\n")
+
+if __name__ == '__main__':
+    try:
+        import osscmdlib.pkginfo as pkginfo
+        from oss.oss_api import OssAPI
+        from oss.oss_xml_handler import *
+        from osscmdlib.utils import *
+        from osscmdlib.Config import Config
+        from osscmdlib.ossuri import *
+        main()
+        sys.exit(0)
+
+    except ImportError, e:
+        report_exception(e)
+        sys.exit(1)
+        
+    except ParameterError, e:
+        error(u"Parameter problem: %s" % e)
+        sys.exit(1)
+        
+    except SystemExit, e:
+        sys.exit(e.code)
+
+    except KeyboardInterrupt:
+        sys.stderr.write("The program stoped by interupt!\n")
+        sys.exit(1)
+
+    except Exception, e:
+        report_exception(e)
+        sys.exit(1)

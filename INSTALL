@@ -1,0 +1,4 @@
+Just run:
+python setup.py install
+(If you do not have a root authority, you may need to run: sudo python setup.py install)
+

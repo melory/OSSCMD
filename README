@@ -1,0 +1,95 @@
+OSSCMD
+======
+
+S3cmd is a command line tool for uploading, retrieving and managing data in Aliyun OSS.
+
+(Chinese README)
+查看INSTALL文件查看具体的安装方法
+(运行 python setup.py install, Linux下可能需要管理员权限，如在ubuntu下，
+cd 到setup.py所在目录，然后输入:sudo python setup.py install，这样就可以像使用Linux
+自带的其他命令一样使用osscmd命令)
+
+osscmd支持Windows和Linux平台,在Linux平台下可以安装为系统的一条命令。
+很多Linux的用户更习惯命令行的操作,osscmd也更适合在linux下使用
+
+osscmd提供了访问和OSS的命令行接口,提供了包括
+1: 一些基本的命令如ls,la,sign(用secret key对任意字符串签名)
+2: 对bucket的基本操作,包括create,delete,setacl,getacl,head
+3: 上传文件(object),文件夹到OSS
+4: 下载文件(object),文件夹到本地
+5: 删除OSS上object或者某个子目录
+6: 提供同步功能,同步文件或文件夹到OSS（OSS同步到本地暂不支持）
+7: OSS端的拷贝(cp)和移动(mv)操作等等
+8: 丰富的命令行选项
+9: 具体可以通过运行命令osscmd --help看到具体的帮助信息
+命令
+
+
+osscmd命令举例
+
+1: 首次运行osscmd命令需要进行配置,主要配置oss的secret_key和access_id保存到配置文件
+命令:osscmd --configure
+
+2: 列举bucket或文件夹ls
+	osscmd ls:显示所有的bucket
+	osscmd ls oss://bucket-name/[prefix]: 列出指定目录下当前层的object
+	osscmd ls -r oss://bucket-name/[prefix]: 递归的显示此目录下所有的object
+	osscmd la:显示所有bucket下所有的objcet,每个bucket每次至多显示1000个object
+	
+3:创建bucket
+	osscmd mb oss://bucket-name
+	osscmd mb oss://bucket-name --acl-public:创建一个public的bucket
+	osscmd mb oss://bucket-name --acl-private:创建一个private的bucket
+	
+3:删除bucket
+	osscmd rb oss://bucket-name
+		如果bucket不为空需要指定-r --recursive选项,否则删除失败
+
+4:查看和修改某个bucket的acl
+	osscmd getacl oss://bucket-name/[prefix]:获取指定bucket的acl,prefix会被忽略
+	osscmd setacl oss://bucket-name/ --acl-public:设置指定bucket的acl,目前不提供
+		设置public-read-write权限
+		
+5:上传文件或目录qianhui@cs.zju.edu.cn
+	osscmd put localfile oss://bucket-name/[prefix] 上传一个文件到OSS
+	osscmd put -r localdir oss://bucket-name/[prefix] 上传一个目录到OSS
+		上传目录是如果加了--dry-run(-n)那么命令行会显示这要上传的文件列表,
+		但是不会进行实际的上传操作,改选项同样适用于get,del,sync等操作
+
+6:下载文件或目录
+	osscmd get oss://bucket-name/file localdir/file2:将oss上的file文件下载到
+		本地保存为file2,如果不指定第二个参数,则保存到当前目录,如果第二个参数
+		是一个目录,则将文件下载到指定目录下,文件名认为file
+	osscmd get -r oss://bucket-name/[prefix] localdir:将oss上的指定bucket下某个
+		子目录(前缀)下载到本地目录,localdir必须是一个目录
+	osscmd get -r --dry-run oss://bucket-name/[prefix]  localdir:--dry-run的作用参见4
+	
+7:删除文件或目录
+	osscmd del oss://bucket-name/file:删除指定bucket下的某个file文件
+	osscmd del -r oss://bucket-name/[prefix]:如果删除是一个子目录(不止一个文件),必须
+		指定-r(--recursive)选项
+
+8:获取某个bucket或object的信息
+	osscmd info oss://bucket-name/[file]
+	
+9:在OSS端执行copy和move操作
+	osscmd cp oss://bucket1/[prefix] oss://bucket2/[prefix]:将bucket1下某个文件或子目录
+		拷贝到bucket2的某个子目录下,如果拷贝不是一个文件,必须指定-r(--recursive选项)
+	osscmd cp oss://bucket1/[prefix] oss://bucket2/[prefix]:功能通cp相同,只是copy好后,将
+		源文件或目录删除
+	可以指定-n(--dry-run)选项先查看此次操作的会移动的文件
+
+10:同步功能
+	osscmd sync localdir oss://bucket-name/[prefix]:同步到oss端,通过比对文件的大小和md5值
+		确定是否需要上传文件,如果大小和md5一直则不上传,同样可以使用-n(--dry-run)选项查看上传的
+		文件和不执行实际的操作
+	osscmd sync oss://bucket-name/[prefix] localdir:将OSS端的文件数据同步到本地，仍然是通过比较
+	两端两个文件（如果存在）的size和md5值,如果指定--no-check-md5选项，则不检查md5值
+
+11:用secret key对任意字符串签名
+	osscmd sign string
+
+12:输出info信息和debug信息
+	每条命令指定-v(--verbose)和-d(--debug)选项
+	
+13:更多的选项和命令请使用osscmd --help查看
