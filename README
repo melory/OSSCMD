@@ -1,7 +1,7 @@
 OSSCMD
 ======
 
-S3cmd is a command line tool for uploading, retrieving and managing data in Aliyun OSS.
+OSScmd is a command line tool for uploading, retrieving and managing data in Aliyun OSS.
 
 (Chinese README)
 查看INSTALL文件查看具体的安装方法
